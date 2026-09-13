@@ -8,6 +8,7 @@
 #include <linux/uaccess.h>
 
 #include <linux/xarray.h>
+#include <linux/list.h>
 
 #define DRV_NAME     "linux-driver" // 디바이스 드라이버 이름
 #define DSK_NAME     "linux-disk" // 디스크 이름
@@ -33,17 +34,25 @@ struct display_info {
     struct display_entry entries[];
 };
 
+struct free_list {
+    u32 idx; // pba idx
+    struct list_head node;
+};
+
 /** pointer **/
 static int pba_ptr = 0;
 static int lba_ptr = 0;
 
 /** L2P 매핑을 위한 XArray, free list 관리를 위한 Doubly Linked List 구현 **/
 DEFINE_XARRAY(xa); // XArray 구현
+
 #define DISPLAY_INDEX   1
 #define GET_COUNT       2
 
-
 static char *DRV_data;              // 블럭 디바이스 데이터 저장 공간
+
+// free list 관리를 위한 변수
+static LIST_HEAD(free_list_head);
 
 // Function Prototype
 int DRV_init_module(void);
@@ -256,9 +265,24 @@ int DRV_write(struct request *rq) {
     
     int blk_count = blk_rq_sectors(rq);
 
+    void *old_pba_entry; //xarray에 사용할 사용자 데이터 구조체
+
     // 순회하며 L2P 매핑 수행
     for (int x=0; x<blk_count; x++) {
-        xa_store(&xa, lba_ptr, xa_mk_value(pba_ptr), GFP_ATOMIC); // append index to xarray
+        // 먄약 xa_store 시 값이 있다면 기존 값 반환
+        old_pba_entry = xa_store(&xa, lba_ptr, xa_mk_value(pba_ptr), GFP_ATOMIC); // append index to xarray
+        
+        if (old_pba_entry != NULL) {
+            int old_pba = xa_to_value(old_pba);
+            struct free_list *new_node;
+            new_node = kmalloc(sizeof(*new_node), GFP_KERNEL);
+            if (!new_node) {
+                return -ENOMEM;
+            }
+            new_node->idx = old_pba;
+            list_add(&new_node->node, &free_list_head); // stack 형태로 stale node 추가
+
+        }
         lba_ptr++;
         pba_ptr++;
     }
