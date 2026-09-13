@@ -5,6 +5,7 @@
 #include <linux/blk-mq.h>
 #include <linux/blkdev.h>
 #include <linux/memory.h>
+#include <linux/uaccess.h>
 
 #include <linux/xarray.h>
 
@@ -22,12 +23,24 @@ static struct gendisk *DRV_disk;
 static struct queue_limits limit;
 static struct blk_mq_tag_set tag_set;
 
+static struct display_entry {
+    u32 lba;
+    u32 pba;
+};
+
+struct display_info {
+    int count;
+    struct display_entry entries[];
+};
+
 /** pointer **/
 static int pba_ptr = 0;
 static int lba_ptr = 0;
 
 /** L2P 매핑을 위한 XArray, free list 관리를 위한 Doubly Linked List 구현 **/
 DEFINE_XARRAY(xa); // XArray 구현
+#define DISPLAY_INDEX   1
+#define GET_COUNT       2
 
 
 static char *DRV_data;              // 블럭 디바이스 데이터 저장 공간
@@ -36,7 +49,12 @@ static char *DRV_data;              // 블럭 디바이스 데이터 저장 공�
 int DRV_init_module(void);
 void DRV_cleanup_module(void);
 blk_status_t DRV_request(struct blk_mq_hw_ctx *hctx, const struct blk_mq_queue_data *bd);
+int DRV_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cmd, unsigned long arg);
 int DRV_write(struct request *rq);
+int DRV_display_index(unsigned long arg);
+int DRV_get_count_display(unsigned long arg);
+
+
 
 // Device Operations
 static const struct blk_mq_ops bdops =
@@ -45,7 +63,9 @@ static const struct blk_mq_ops bdops =
     // .timeout = DRV_timeout // 타임아웃 처리
 };
 
-static const struct block_device_operations fops = {};
+static const struct block_device_operations fops = {
+    .ioctl = DRV_ioctl
+};
 
 // Entry Function
 int DRV_init_module(void)
@@ -149,6 +169,68 @@ blk_status_t DRV_request(struct blk_mq_hw_ctx *hctx, const struct blk_mq_queue_d
     // rq가 끝났음을 알리기
     blk_mq_end_request(rq, status);
     return BLK_STS_OK;
+}
+
+int DRV_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cmd, unsigned long arg)
+{
+    switch(cmd) {
+    case DISPLAY_INDEX:
+        DRV_display_index(arg);
+        break;
+    case GET_COUNT:
+        DRV_get_count_display(arg);
+        break;
+    }
+    return 0;
+}
+
+int DRV_get_count_display(unsigned long arg)
+{
+    int count = 0;
+    unsigned long i;
+    void *entry;
+
+    // find xarray size
+    xa_for_each(&xa, i, entry) count++;
+
+    if (copy_to_user((void __user *)arg, &count, sizeof(count))) {
+        return -EFAULT;
+    }
+    return 0;
+}
+
+int DRV_display_index(unsigned long arg)
+{
+    unsigned long i;
+    void *entry;
+    int count = 0;
+    struct display_info *display_info;
+
+    // find xarray size
+    xa_for_each(&xa, i, entry) count++;
+
+    unsigned long size = sizeof(*display_info) + count * sizeof(struct display_entry);
+    display_info = kmalloc(size, GFP_KERNEL);
+
+    // kmalloc 실패 시
+    if (!display_info) return -ENOMEM;
+
+    int idx = 0;
+    xa_for_each(&xa, i, entry) {
+        display_info -> entries[idx].lba = i;
+        display_info -> entries[idx].pba = xa_to_value(entry);
+        idx++;
+    }
+
+    display_info->count = count;
+
+    if (copy_to_user((void __user *)arg, display_info, size)) {
+        kfree(display_info);
+        return -EFAULT;
+    }
+
+    kfree(display_info); // 할당 해제
+    return 0;
 }
 
 int DRV_write(struct request *rq) {
