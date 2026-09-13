@@ -168,7 +168,7 @@ blk_status_t DRV_request(struct blk_mq_hw_ctx *hctx, const struct blk_mq_queue_d
 
     switch(req_op(rq)) { // blk_opf_t : 연산 + 플래그 (REQ_OP_* | REQ_*)
     case REQ_OP_READ:
-        printk("Test Success!!");
+        DRV_read(rq);
         break;
     case REQ_OP_WRITE:
         DRV_write(rq);
@@ -239,6 +239,101 @@ int DRV_display_index(unsigned long arg)
     }
 
     kfree(display_info); // 할당 해제
+    return 0;
+}
+
+int DRV_read(struct request *rq)
+{
+    struct bio_vec bvec; // 물리 메모리 주소의 연속된 범위를 표현하는 구조체
+    struct req_iterator iter;
+    lba_ptr = blk_rq_pos(rq); // 현재 섹터 위치 얻어오기
+    int lba_left_len =  blk_rq_bytes(rq); // request 전체에서 읽어야 할 남은 바이트 기록
+    int lba_offset = 0; // LBA 블록 내 어디까지 읽었는지 기록 (0 ~ 512B 사이의 값)
+    
+    // request 내 모든 bio_vec 세그먼트 순회
+    rq_for_each_segment(bvec, rq, iter) {
+        int bv_left_len = bvec.bv_len; // bvec가 얼마나 남았는지 기록
+        int bv_offset = 0; // bvec 내 어디까지 썼는지 기록
+
+        void *entry = xa_load(&xa, lba_ptr);
+        // 읽기에 실패한 경우
+        if (!entry) {
+            printk("Error read pba data");
+            return -EFAULT;
+        }
+
+        // 공간 및 주소 할당
+        void *kaddr = bvec_kmap_local(&bvec);
+
+        // 현재 위치 계산
+        u32 read_pba = xa_to_value(entry);
+        char *pos = DRV_data + (read_pba * DRV_BLK_SIZE) + lba_offset;
+
+        // LBA 데이터를 읽어서 bvec에 추가
+        // 블록 값이 넘어가면 pba 값도 다시 계산 필요
+        if (lba_left_len > DRV_BLK_SIZE - lba_offset) {
+
+            if (bvec.bv_len < DRV_BLK_SIZE - lba_offset) {
+                memcpy(kaddr+bv_offset, pos, bvec.bv_len);
+                lba_left_len -= bvec.bv_len;
+                bv_offset += bvec.bv_len;
+                lba_offset += bvec.bv_len;
+            } else {
+                while (bv_left_len >= DRV_BLK_SIZE - lba_offset) {
+                    int cpy_len = DRV_BLK_SIZE - lba_offset;
+                    memcpy(kaddr+bv_offset, pos, cpy_len);
+                    
+                    bv_offset += cpy_len;
+                    bv_left_len -= cpy_len;
+                    lba_left_len -= cpy_len;
+
+                    lba_ptr++;
+                    lba_offset = 0;
+
+                    if (bv_left_len == 0) break; // 만약 bvec를 다 사용했다면 break
+
+                    entry = xa_load(&xa, lba_ptr);
+                    // 읽기에 실패한 경우
+                    if (!entry) {
+                        printk("Error read pba data");
+                        kunmap_local(kaddr);
+                        return -EFAULT;
+                    }
+                    read_pba = xa_to_value(entry);
+                    pos = DRV_data + (read_pba * DRV_BLK_SIZE);
+                }
+                if (bv_left_len > 0) {
+                    memcpy(kaddr+bv_offset, pos, bv_left_len);
+
+                    bv_offset += bv_left_len;
+                    lba_offset += bv_left_len;
+                    lba_left_len -= bv_left_len;
+
+                    bv_left_len = 0;
+                }
+            }
+        } else {
+            if (bvec.bv_len < lba_left_len) {
+                memcpy(kaddr+bv_offset, pos, bvec.bv_len);
+                lba_offset += bvec.bv_len;
+                lba_left_len -= bvec.bv_len;
+                bv_offset += bv_left_len;
+            } else { // LBA 내용 전부를 읽을 수 있음
+                memcpy(kaddr+bv_offset, pos, lba_left_len);
+                bv_offset += lba_left_len;
+                lba_offset += lba_left_len;
+                lba_left_len = 0;
+
+                if (lba_offset == DRV_BLK_SIZE) {
+                    lba_offset = 0;
+                    lba_ptr++;
+                }
+            }
+            
+        }
+
+        kunmap_local(kaddr);
+    }
     return 0;
 }
 
