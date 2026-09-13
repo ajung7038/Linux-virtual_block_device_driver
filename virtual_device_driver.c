@@ -4,6 +4,9 @@
 #include <linux/init.h>
 #include <linux/blk-mq.h>
 #include <linux/blkdev.h>
+#include <linux/memory.h>
+
+#include <linux/xarray.h>
 
 #define DRV_NAME     "linux-driver" // 디바이스 드라이버 이름
 #define DSK_NAME     "linux-disk" // 디스크 이름
@@ -19,14 +22,21 @@ static struct gendisk *DRV_disk;
 static struct queue_limits limit;
 static struct blk_mq_tag_set tag_set;
 
-static char *DRV_data;              // 블럭 디바이스 데이터 저장 공간
+/** pointer **/
+static int pba_ptr = 0;
+static int lba_ptr = 0;
 
+/** L2P 매핑을 위한 XArray, free list 관리를 위한 Doubly Linked List 구현 **/
+DEFINE_XARRAY(xa); // XArray 구현
+
+
+static char *DRV_data;              // 블럭 디바이스 데이터 저장 공간
 
 // Function Prototype
 int DRV_init_module(void);
 void DRV_cleanup_module(void);
 blk_status_t DRV_request(struct blk_mq_hw_ctx *hctx, const struct blk_mq_queue_data *bd);
-
+int DRV_write(struct request *rq);
 
 // Device Operations
 static const struct blk_mq_ops bdops =
@@ -35,12 +45,7 @@ static const struct blk_mq_ops bdops =
     // .timeout = DRV_timeout // 타임아웃 처리
 };
 
-// File Operations
-static const struct block_device_operations fops =
-{
-    // .open = DRV_open
-};
-
+static const struct block_device_operations fops = {};
 
 // Entry Function
 int DRV_init_module(void)
@@ -111,8 +116,7 @@ int DRV_init_module(void)
 void DRV_cleanup_module(void)
 {
     // 디스크 등록 제거
-    // 혹시 남을 I/O 요청을 안전하게 끝내기 위함
-    del_gendisk(DRV_disk);
+    del_gendisk(DRV_disk); // 혹시 남을 I/O 요청을 안전하게 끝내기 위함
     put_disk(DRV_disk);
 
     // 블럭 디바이스 해제
@@ -129,18 +133,55 @@ void DRV_cleanup_module(void)
 blk_status_t DRV_request(struct blk_mq_hw_ctx *hctx, const struct blk_mq_queue_data *bd)
 {
     struct request *rq = bd -> rq;
-    blk_status_t state = BLK_STS_OK;
+    blk_status_t status = BLK_STS_OK;
 
     blk_mq_start_request(rq); // 타임아웃 타이머 시작
+
     switch(req_op(rq)) { // blk_opf_t : 연산 + 플래그 (REQ_OP_* | REQ_*)
     case REQ_OP_READ:
         printk("Test Success!!");
         break;
+    case REQ_OP_WRITE:
+        DRV_write(rq);
+        break;
     }
 
     // rq가 끝났음을 알리기
-    blk_mq_end_request(rq, state); // void blk_mq_end_request(struct request *rq, blk_status_t error)
+    blk_mq_end_request(rq, status);
     return BLK_STS_OK;
+}
+
+int DRV_write(struct request *rq) {
+
+    struct bio_vec bvec; // 물리 메모리 주소의 연속된 범위를 표현하는 구조체
+    struct req_iterator iter;
+    lba_ptr = blk_rq_pos(rq); // 현재 섹터 위치 얻어오기
+    int data_len = 0;
+
+    // request 내 모든 bio_vec 세그먼트 순회
+    rq_for_each_segment(bvec, rq, iter) {
+
+        // 현재 세그먼트(bvec)의 페이지 주소, 데이터 가져오기
+        unsigned int len = bvec.bv_len;
+
+        printk("[START] Writing data to the blk-mq device\n");
+        void *kaddr = bvec_kmap_local(&bvec);
+        memcpy(DRV_data + (pba_ptr * DRV_BLK_SIZE) + data_len, kaddr, len); // 데이터 저장
+        data_len += len;
+        printk("[END] Writing data to the blk-mq device\n");
+        kunmap_local(kaddr);
+    }
+    
+    int blk_count = blk_rq_sectors(rq);
+
+    // 순회하며 L2P 매핑 수행
+    for (int x=0; x<blk_count; x++) {
+        xa_store(&xa, lba_ptr, xa_mk_value(pba_ptr), GFP_ATOMIC); // append index to xarray
+        lba_ptr++;
+        pba_ptr++;
+    }
+
+    return 0;
 }
 
 module_init(DRV_init_module);
