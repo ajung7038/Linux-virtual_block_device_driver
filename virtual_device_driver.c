@@ -41,15 +41,16 @@ struct free_list {
 
 /** pointer **/
 static int pba_ptr = 0;
-static int lba_ptr = 0;
 
 /** L2P 매핑을 위한 XArray, free list 관리를 위한 Doubly Linked List 구현 **/
 DEFINE_XARRAY(xa); // XArray 구현
 
-#define DISPLAY_INDEX   1
-#define GET_COUNT       2
+#define             IOCTL_MAGIC         'G'
+#define             DISPLAY_INDEX       _IOR(IOCTL_MAGIC, 2 ,struct display_info)
+#define             GET_COUNT           _IOR(IOCTL_MAGIC, 3 ,struct display_info)
 
 static char *DRV_data;              // 블럭 디바이스 데이터 저장 공간
+static char *GC_buffer;             // GC 시 사용할 임시 버퍼
 
 // free list 관리를 위한 변수
 static LIST_HEAD(free_list_head);
@@ -62,7 +63,9 @@ int DRV_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cmd, unsigned
 int DRV_write(struct request *rq);
 int DRV_display_index(unsigned long arg);
 int DRV_get_count_display(unsigned long arg);
-
+int DRV_count_xa(void);
+int DRV_garbage_collector(void);
+int DRV_read(struct request *rq);
 
 
 // Device Operations
@@ -189,23 +192,32 @@ int DRV_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cmd, unsigned
     case GET_COUNT:
         DRV_get_count_display(arg);
         break;
+    default:
+        return -ENOTTY;
     }
     return 0;
 }
 
 int DRV_get_count_display(unsigned long arg)
 {
+    int count = DRV_count_xa();
+
+    printk(KERN_INFO, "[GET_COUNT] count=%d pba_ptr=%d\n",count, pba_ptr);
+
+    if (copy_to_user((void __user *)arg, &count, sizeof(count))) {
+        return -EFAULT;
+    }
+    return 0;
+}
+
+int DRV_count_xa(void) {
     int count = 0;
     unsigned long i;
     void *entry;
 
     // find xarray size
     xa_for_each(&xa, i, entry) count++;
-
-    if (copy_to_user((void __user *)arg, &count, sizeof(count))) {
-        return -EFAULT;
-    }
-    return 0;
+    return count;
 }
 
 int DRV_display_index(unsigned long arg)
@@ -218,8 +230,12 @@ int DRV_display_index(unsigned long arg)
     // find xarray size
     xa_for_each(&xa, i, entry) count++;
 
+    printk(KERN_INFO
+       "[DISPLAY_INDEX] count=%d pba_ptr=%d\n",
+       count, pba_ptr);
+
     unsigned long size = sizeof(*display_info) + count * sizeof(struct display_entry);
-    display_info = kmalloc(size, GFP_KERNEL);
+    display_info = kvmalloc(size, GFP_KERNEL);
 
     // kmalloc 실패 시
     if (!display_info) return -ENOMEM;
@@ -238,7 +254,7 @@ int DRV_display_index(unsigned long arg)
         return -EFAULT;
     }
 
-    kfree(display_info); // 할당 해제
+    kvfree(display_info); // 할당 해제
     return 0;
 }
 
@@ -246,7 +262,7 @@ int DRV_read(struct request *rq)
 {
     struct bio_vec bvec; // 물리 메모리 주소의 연속된 범위를 표현하는 구조체
     struct req_iterator iter;
-    lba_ptr = blk_rq_pos(rq); // 현재 섹터 위치 얻어오기
+    u32 lba_ptr = blk_rq_pos(rq); // 현재 섹터 위치 얻어오기
     int lba_left_len =  blk_rq_bytes(rq); // request 전체에서 읽어야 할 남은 바이트 기록
     int lba_offset = 0; // LBA 블록 내 어디까지 읽었는지 기록 (0 ~ 512B 사이의 값)
     
@@ -341,8 +357,20 @@ int DRV_write(struct request *rq) {
 
     struct bio_vec bvec; // 물리 메모리 주소의 연속된 범위를 표현하는 구조체
     struct req_iterator iter;
-    lba_ptr = blk_rq_pos(rq); // 현재 섹터 위치 얻어오기
+    u32 lba_ptr = blk_rq_pos(rq); // 현재 섹터 위치 얻어오기
     int data_len = 0;
+
+    // 끝에 다다랐다면 gc 수행
+    int blk_count = blk_rq_sectors(rq); // 읽어야 할 request 섹터 개수
+
+    if (pba_ptr + blk_count > DRV_TOTALBLK) {
+        int ret = DRV_garbage_collector();
+
+        if (ret) return ret;
+        
+        // GC 이후에도 공간이 부족하다면
+        if (pba_ptr + blk_count > DRV_TOTALBLK) return -ENOSPC;
+    }
 
     // request 내 모든 bio_vec 세그먼트 순회
     rq_for_each_segment(bvec, rq, iter) {
@@ -350,16 +378,12 @@ int DRV_write(struct request *rq) {
         // 현재 세그먼트(bvec)의 페이지 주소, 데이터 가져오기
         unsigned int len = bvec.bv_len;
 
-        printk("[START] Writing data to the blk-mq device\n");
         void *kaddr = bvec_kmap_local(&bvec);
         memcpy(DRV_data + (pba_ptr * DRV_BLK_SIZE) + data_len, kaddr, len); // 데이터 저장
         data_len += len;
-        printk("[END] Writing data to the blk-mq device\n");
         kunmap_local(kaddr);
     }
     
-    int blk_count = blk_rq_sectors(rq);
-
     void *old_pba_entry; //xarray에 사용할 사용자 데이터 구조체
 
     // 순회하며 L2P 매핑 수행
@@ -368,20 +392,62 @@ int DRV_write(struct request *rq) {
         old_pba_entry = xa_store(&xa, lba_ptr, xa_mk_value(pba_ptr), GFP_ATOMIC); // append index to xarray
         
         if (old_pba_entry != NULL) {
-            int old_pba = xa_to_value(old_pba);
+            int old_pba = xa_to_value(old_pba_entry);
             struct free_list *new_node;
             new_node = kmalloc(sizeof(*new_node), GFP_KERNEL);
             if (!new_node) {
                 return -ENOMEM;
             }
             new_node->idx = old_pba;
-            list_add(&new_node->node, &free_list_head); // stack 형태로 stale node 추가
+            list_add(&new_node->node, &free_list_head); // stale node 추가
 
         }
         lba_ptr++;
         pba_ptr++;
     }
 
+    return 0;
+}
+
+int DRV_garbage_collector(void) {
+
+    // XArray(L2P)를 돌며 사용하고 있는 pba를 앞/뒤의 세그먼트로 나누기
+    void* entry;
+    unsigned long lba_ptr;
+    int old_pba;
+    int new_pba = 0; // 다음 시작 위치 (지금은 두 번째 공간)
+    u32 buffer_size = 0;
+    int xa_size = DRV_count_xa();
+    
+    // 임시 버퍼 공간 할당
+    if ((GC_buffer = vmalloc(xa_size * DRV_BLK_SIZE)) == NULL)
+    {
+        printk("Failed to allocate GC_buffer\n");
+        return -ENOMEM;
+    }
+
+    xa_for_each(&xa, lba_ptr, entry) {
+        old_pba = xa_to_value(entry);
+        memcpy(GC_buffer + new_pba * DRV_BLK_SIZE, DRV_data + old_pba * DRV_BLK_SIZE, DRV_BLK_SIZE);
+        xa_store(&xa, lba_ptr, xa_mk_value(new_pba), GFP_KERNEL);
+        new_pba++;
+        buffer_size += DRV_BLK_SIZE;
+    }
+
+    // 임시 공간 -> DRV_data로 압축
+    memcpy(DRV_data, GC_buffer, buffer_size);
+    pba_ptr = new_pba;
+
+    struct free_list *node, *tmp;
+    list_for_each_entry_safe(node, tmp, &free_list_head, node) { // 순회하면서 삭제 가능
+        list_del(&node -> node);
+        kfree(node); // 할당된 영역 해제
+    }
+
+    // 임시 버퍼 할당 해제
+    vfree(GC_buffer);
+    GC_buffer = NULL;
+    
     return 0;
 }
 
