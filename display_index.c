@@ -4,8 +4,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#define DISPLAY_INDEX   1
-#define GET_COUNT       2
+#define             IOCTL_MAGIC         'G'
+#define             DISPLAY_INDEX       _IOR(IOCTL_MAGIC, 2 ,struct display_info)
+#define             GET_COUNT           _IOR(IOCTL_MAGIC, 3 ,struct display_info)
 
 int main(void) {
     struct display_entry {
@@ -29,6 +30,8 @@ int main(void) {
     int count;
     if (ioctl(fd, GET_COUNT, &count) < 0) {
         printf("ERROR: Cannot found display index count");
+        close(fd);
+        return 1;
     }
 
     int size = sizeof(struct display_info) + count * sizeof(struct display_entry);
@@ -39,6 +42,9 @@ int main(void) {
     // L2P 정보 얻기
     if (ioctl(fd, DISPLAY_INDEX, info_data) < 0) {
         printf("ERROR: display_index\n");
+        free(info_data);
+        close(fd);
+        return 1;
     }
 
     
@@ -55,7 +61,7 @@ int main(void) {
     }
 
     printf("====================\n");
-    printf("total: %d", info_data -> count);
+    printf("total: %d\n", info_data -> count);
 
 
     free(info_data); // 할당 해제
