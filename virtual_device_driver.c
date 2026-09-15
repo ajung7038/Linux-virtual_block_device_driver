@@ -1,6 +1,10 @@
 #include <linux/vmalloc.h>
 #include <linux/kernel.h>
+#include <linux/fs.h>
+
 #include <linux/module.h>
+#include <linux/moduleparam.h>
+
 #include <linux/init.h>
 #include <linux/blk-mq.h>
 #include <linux/blkdev.h>
@@ -19,10 +23,17 @@
 #define DRV_MAJOR       0 // 드라이버 major number
 #define DRV_MINOR       0 // 드라이버 minor number
 
+#define PERSIST_PATH "/var/lib/linux-device"
+
 static int DRV_major_num = 0;
 static struct gendisk *DRV_disk;
 static struct queue_limits limit;
 static struct blk_mq_tag_set tag_set;
+
+static bool persist = true;
+
+module_param(persist, bool, 0644); // 변수명, 타입, 권한
+MODULE_PARM_DESC(persist, "Enable persist mode (default=true)");
 
 static struct display_entry {
     u32 lba;
@@ -46,10 +57,10 @@ static int pba_ptr = 0;
 DEFINE_XARRAY(xa); // XArray 구현
 
 /** Mutex 정의 **/
-DEFINE_MUTEX(read_mtx); // xarray 읽기 뮤텍스
+DEFINE_MUTEX(xa_mtx); // xarray 뮤텍스
 DEFINE_MUTEX(write_mtx); // xarray 쓰기 뮤텍스
 DEFINE_MUTEX(flist_mtx); // free list 추가/수정/삭제 뮤텍스
-
+DEFINE_MUTEX(persist_mtx); // persist 옵션이 켜져 있을 경우
 
 #define             IOCTL_MAGIC         'G'
 #define             DISPLAY_INDEX       _IOR(IOCTL_MAGIC, 2, struct display_info)
@@ -87,6 +98,17 @@ static const struct block_device_operations fops = {
     .ioctl = DRV_ioctl
 };
 
+struct persist_save_xa {
+    u32 lba;
+    u32 pba;
+};
+
+struct persist_metadata {
+    u32 pba_ptr;
+    u32 xa_count;
+    u32 lst_count;
+};
+
 // Entry Function
 int DRV_init_module(void)
 {
@@ -118,6 +140,99 @@ int DRV_init_module(void)
     }
 
     printk(DRV_NAME " : Device registered with Major Number = %d\n", DRV_major_num);
+
+    // 만약 persist 옵션이 켜져 있다면 내용 불러오기
+    if (persist) {
+        struct file *persist_file;
+
+        struct persist_metadata metadata;
+        struct persist_save_xa map;
+        struct free_list *node;
+
+        int idx = 0;
+        char *PERSIST_data = NULL;
+
+        size_t size;
+        ssize_t file_len;
+        size_t offset = 0;
+
+        loff_t file_offset = 0;
+        
+        int ret = 0;
+
+        // 파일 열기
+        mutex_lock(&persist_mtx);
+        persist_file = filp_open(PERSIST_PATH, O_RDONLY, 0);
+
+        if (!IS_ERR(persist_file)) {
+            // 메타데이터 읽기 -> 나머지 size 파악
+            file_len = kernel_read(persist_file, &metadata, sizeof(metadata), &file_offset);
+
+            if (file_len != sizeof(metadata)) {
+                filp_close(persist_file, NULL);
+                mutex_unlock(&persist_mtx);
+
+                vfree(DRV_data);
+                blk_mq_free_tag_set(&tag_set);
+                return -EFAULT;
+            }
+
+            size = sizeof(struct persist_metadata) + DRV_LENGTH + metadata.xa_count * sizeof(struct persist_save_xa) + metadata.lst_count * sizeof(u32);
+
+            PERSIST_data = vmalloc(size);
+            if (!PERSIST_data) {
+                filp_close(persist_file, NULL);
+                mutex_unlock(&persist_mtx);
+
+                vfree(DRV_data);
+                blk_mq_free_tag_set(&tag_set);
+
+                return -ENOMEM;
+            }
+
+            memcpy(PERSIST_data, &metadata, sizeof(metadata));
+
+            // 메타데이터 빼고 나머지 부분 읽기
+            file_len = kernel_read(persist_file, PERSIST_data + sizeof(metadata), size - sizeof(metadata), &file_offset);
+
+            filp_close(persist_file, NULL);
+            offset = sizeof(struct persist_metadata);
+
+            // DRV_data 복사
+            memcpy(DRV_data, PERSIST_data + offset, DRV_LENGTH);
+            offset += DRV_LENGTH;
+
+            // XArray 복사
+            for (idx = 0; idx < metadata.xa_count; idx++) {
+                memcpy(&map, PERSIST_data + offset, sizeof(map));
+                offset += sizeof(map);
+
+                xa_store(&xa, map.lba, xa_mk_value(map.pba), GFP_KERNEL);
+            }
+
+            // XArray가 존재해야만 free list가 존재할 수 있으므로
+            if (!ret) {
+                for (idx = 0; idx < metadata.lst_count; idx++) {
+                    u32 old_pba_ptr;
+
+                    memcpy(&old_pba_ptr, PERSIST_data+offset, sizeof(old_pba_ptr));
+                    offset += sizeof(old_pba_ptr);
+
+                    node = kmalloc(sizeof(*node), GFP_KERNEL);
+
+                    if (!node) break; // 공간이 부족해질 경우 할당 중단
+
+                    node->idx = old_pba_ptr;
+
+                    list_add(&node -> node, &free_list_head); // 돌면서 리스트에 추가
+                }
+            }
+
+            pba_ptr = metadata.pba_ptr;
+            vfree(PERSIST_data);
+        }
+        mutex_unlock(&persist_mtx);
+    }
 
     DRV_disk = blk_mq_alloc_disk(&tag_set, &limit, DRV_data); // 내부적으로 큐도 같이 생성
     
@@ -155,8 +270,99 @@ int DRV_init_module(void)
 
 void DRV_cleanup_module(void)
 {
+    // 만약 persist 옵션이 켜져 있다면
+    if (persist) {
+        unsigned long i;
+        void *entry;
+
+        int lst_count = 0;
+
+        // 파일 열어서 공간에 접근
+        size_t size;
+        int offset = 0;
+        
+        struct persist_metadata metadata;
+        struct free_list *node;
+        char *PERSIST_data;
+
+        struct file *persist_file; // 내용을 쓸 파일
+        loff_t file_offset = 0;
+        ssize_t file_len;
+
+        mutex_lock(&persist_mtx);
+        int xa_count = DRV_count_xa();
+
+        
+        if (!list_empty(&free_list_head)) {
+            list_for_each_entry(node, &free_list_head, node) lst_count++;
+        }
+
+        size = sizeof(struct persist_metadata) + DRV_LENGTH + xa_count * sizeof(struct persist_save_xa) + lst_count * sizeof(u32);
+
+        PERSIST_data = vmalloc(size);
+        if (!PERSIST_data) {
+            mutex_unlock(&persist_mtx);
+            // 할당된 공간을 차례대로 해제
+            del_gendisk(DRV_disk); // 혹시 남을 I/O 요청을 안전하게 끝내기 위함
+            put_disk(DRV_disk);
+            unregister_blkdev(DRV_major_num, DRV_NAME);
+            blk_mq_free_tag_set(&tag_set);
+            vfree(DRV_data);
+            return;
+        }
+
+        metadata.pba_ptr = pba_ptr;
+        metadata.xa_count = xa_count;
+        metadata.lst_count = lst_count;
+
+        // 메타데이터 저장
+        memcpy(PERSIST_data + offset, &metadata, sizeof(metadata));
+        offset += sizeof(metadata);
+
+        // 데이터 (16MB) 저장
+        memcpy(PERSIST_data + offset, DRV_data, DRV_LENGTH);
+        offset += DRV_LENGTH;
+
+        // XArray 저장 (저장하는 동안 다른 프로세스/스레드가 XArray를 변화하지 못하게 해야함)
+        xa_for_each(&xa, i, entry) {
+            struct persist_save_xa map;
+            map.lba = i;
+            map.pba = xa_to_value(entry);
+            memcpy(PERSIST_data + offset, &map, sizeof(map));
+            offset += sizeof(map);
+        };
+
+        // free list 저장
+        list_for_each_entry(node, &free_list_head, node) {
+            u32 old_pba_ptr = node -> idx;
+            memcpy(PERSIST_data+offset, &old_pba_ptr, sizeof(old_pba_ptr));
+            offset += sizeof(old_pba_ptr);
+        }
+
+        persist_file = filp_open(PERSIST_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+        if (IS_ERR(persist_file)) { // 파일을 열지 못했다면
+            vfree(PERSIST_data);
+            mutex_unlock(&persist_mtx);
+            // 할당된 공간을 차례대로 해제
+            del_gendisk(DRV_disk); // 혹시 남을 I/O 요청을 안전하게 끝내기 위함
+            put_disk(DRV_disk);
+            unregister_blkdev(DRV_major_num, DRV_NAME);
+            blk_mq_free_tag_set(&tag_set);
+            vfree(DRV_data);
+            return;
+        }
+
+        file_len = kernel_write(persist_file, PERSIST_data, size, &file_offset);
+        filp_close(persist_file, NULL);
+
+
+        vfree(PERSIST_data);
+        mutex_unlock(&persist_mtx);
+    }
+
     // 디스크 등록 제거
-    del_gendisk(DRV_disk); // 혹시 남을 I/O 요청을 안전하게 끝내기 위함
+    del_gendisk(DRV_disk); // 혹시 남아 있을 I/O 요청을 안전하게 끝내기 위함
     put_disk(DRV_disk);
 
     // 블럭 디바이스 해제
@@ -280,7 +486,7 @@ int DRV_read(struct request *rq)
     int lba_left_len =  blk_rq_bytes(rq); // request 전체에서 읽어야 할 남은 바이트 기록
     int lba_offset = 0; // LBA 블록 내 어디까지 읽었는지 기록 (0 ~ 512B 사이의 값)
     
-    mutex_lock(&read_mtx);
+    mutex_lock(&xa_mtx);
 
     // request 내 모든 bio_vec 세그먼트 순회
     rq_for_each_segment(bvec, rq, iter) {
@@ -292,7 +498,7 @@ int DRV_read(struct request *rq)
         // 읽기에 실패한 경우
         if (!entry) {
             printk("Error read pba data");
-            mutex_unlock(&read_mtx);
+            mutex_unlock(&xa_mtx);
             return -EFAULT;
         }
 
@@ -331,7 +537,7 @@ int DRV_read(struct request *rq)
                     // 읽기에 실패한 경우
                     if (!entry) {
                         printk("Error read pba data");
-                        mutex_unlock(&read_mtx);
+                        mutex_unlock(&xa_mtx);
                         kunmap_local(kaddr);
                         return -EFAULT;
                     }
@@ -372,12 +578,12 @@ int DRV_read(struct request *rq)
 
         kunmap_local(kaddr);
     }
-    mutex_unlock(&read_mtx);
+    mutex_unlock(&xa_mtx);
     return 0;
 }
 
 int DRV_write(struct request *rq) {
-
+    mutex_lock(&persist_mtx);
     struct bio_vec bvec; // 물리 메모리 주소의 연속된 범위를 표현하는 구조체
     struct req_iterator iter;
     int lba_offset = 0; // 현재 PBA 블록에서 어디까지 썼는지 기록
@@ -394,7 +600,10 @@ int DRV_write(struct request *rq) {
     } else {
         int ret = pop_free_list(&new_pba);
         mutex_unlock(&write_mtx);
-        if (ret) return ret;
+        if (ret) {
+            mutex_unlock(&persist_mtx);
+            return ret;
+        }
     }
 
     // request 내 모든 bio_vec 세그먼트 순회
@@ -423,9 +632,9 @@ int DRV_write(struct request *rq) {
                 lba_offset += cpy_len;
 
                 // 읽는 동안 L2P 매핑이 변화하면 안 됨
-                mutex_lock(&read_mtx);
+                mutex_lock(&xa_mtx);
                 old_pba_entry = xa_store(&xa, lba_ptr, xa_mk_value(new_pba), GFP_ATOMIC); // append index to xarray
-                mutex_unlock(&read_mtx);
+                mutex_unlock(&xa_mtx);
 
                 if (old_pba_entry != NULL) { // overwrite인 경우
                     int old_pba = xa_to_value(old_pba_entry);
@@ -433,6 +642,7 @@ int DRV_write(struct request *rq) {
                     struct free_list *new_node;
                     new_node = kmalloc(sizeof(*new_node), GFP_KERNEL);
                     if (!new_node) {
+                        mutex_unlock(&persist_mtx);
                         kunmap_local(kaddr);
                         return -ENOMEM;
                     }
@@ -458,6 +668,7 @@ int DRV_write(struct request *rq) {
                     mutex_unlock(&write_mtx);
                     if (ret) {
                         kunmap_local(kaddr);
+                        mutex_unlock(&persist_mtx);
                         return ret;
                     }
                 }
@@ -473,6 +684,7 @@ int DRV_write(struct request *rq) {
 
         kunmap_local(kaddr);
     }
+    mutex_unlock(&persist_mtx);
     return 0;
 }
 
