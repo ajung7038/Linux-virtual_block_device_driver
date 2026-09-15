@@ -149,9 +149,6 @@ int DRV_init_module(void)
         vfree(DRV_data); // vmalloc으로 할당된 공간 해제
         blk_mq_free_tag_set(&tag_set); // tag_set 해제
     }
-
-    // 뮤텍스 초기화
-    ////////////////////////////// mutex_init(rd_mtx);
     
     return result; // 실패 시 음수 반환
 }
