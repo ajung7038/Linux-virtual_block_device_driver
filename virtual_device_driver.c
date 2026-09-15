@@ -173,18 +173,24 @@ void DRV_cleanup_module(void)
 blk_status_t DRV_request(struct blk_mq_hw_ctx *hctx, const struct blk_mq_queue_data *bd)
 {
     struct request *rq = bd -> rq;
-    blk_status_t status = BLK_STS_OK;
+    blk_status_t status;
+    int ret = 0;
 
     blk_mq_start_request(rq); // 타임아웃 타이머 시작
 
     switch(req_op(rq)) { // blk_opf_t : 연산 + 플래그 (REQ_OP_* | REQ_*)
     case REQ_OP_READ:
-        DRV_read(rq);
+        ret = DRV_read(rq);
         break;
     case REQ_OP_WRITE:
-        DRV_write(rq);
+        ret = DRV_write(rq);
+        break;
+    default:
+        ret = -EOPNOTSUPP;
         break;
     }
+
+    status = errno_to_blk_status(ret);
 
     // rq가 끝났음을 알리기
     blk_mq_end_request(rq, status);
