@@ -123,7 +123,7 @@ int DRV_init_module(void)
         return -ENOMEM;
     }
 
-    if ((DRV_data = vmalloc(DRV_LENGTH)) == NULL)
+    if ((DRV_data = vzalloc(DRV_LENGTH)) == NULL)
     {
         blk_mq_free_tag_set(&tag_set); // tag_set 해제
         return -ENOMEM;
@@ -497,9 +497,8 @@ int DRV_read(struct request *rq)
 
         // 읽기에 실패한 경우
         if (!entry) {
-            printk("Error read pba data");
             mutex_unlock(&xa_mtx);
-            return -EFAULT;
+            return 0;
         }
 
         // 공간 및 주소 할당
