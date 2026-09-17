@@ -1,4 +1,4 @@
-obj-m := driver.o
+obj-m := virtual_device_driver.o
 
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
