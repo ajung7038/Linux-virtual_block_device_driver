@@ -64,7 +64,7 @@ DEFINE_MUTEX(persist_mtx); // persist 옵션이 켜져 있을 경우
 
 #define             IOCTL_MAGIC         'G'
 #define             DISPLAY_INDEX       _IOR(IOCTL_MAGIC, 2, struct display_info)
-#define             GET_COUNT           _IOR(IOCTL_MAGIC, 3, struct display_info)
+#define             GET_COUNT           _IOR(IOCTL_MAGIC, 3, int)
 
 static char *DRV_data;              // 블럭 디바이스 데이터 저장 공간
 
@@ -83,6 +83,7 @@ int DRV_read(struct request *rq);
 int DRV_display_index(unsigned long arg);
 int DRV_get_count_display(unsigned long arg);
 int DRV_count_xa(void);
+static int DRV_get_pba(u32 lba, u32 *new_pba);
 
 int pop_free_list(u32 *pba);
 
@@ -582,62 +583,58 @@ int DRV_read(struct request *rq)
 }
 
 int DRV_write(struct request *rq) {
-    mutex_lock(&persist_mtx);
     struct bio_vec bvec; // 물리 메모리 주소의 연속된 범위를 표현하는 구조체
     struct req_iterator iter;
-    int lba_offset = 0; // 현재 PBA 블록에서 어디까지 썼는지 기록
-    void *old_pba_entry;
-    
-    u32 lba_ptr = blk_rq_pos(rq); // 현재 섹터 위치 얻어오기
-    u32 new_pba;
 
-    mutex_lock(&write_mtx);
-    // pbr 포인터 업데이트
-    if (pba_ptr < DRV_TOTALBLK) {
-        new_pba = pba_ptr++;
-        mutex_unlock(&write_mtx);
-    } else {
-        int ret = pop_free_list(&new_pba);
-        mutex_unlock(&write_mtx);
-        if (ret) {
-            mutex_unlock(&persist_mtx);
-            return ret;
-        }
+    u32 lba_ptr = blk_rq_pos(rq); // 현재 섹터 위치 얻어오기
+    int rq_byte_left =  blk_rq_bytes(rq); // 읽어야 할 데이터 양 (바이트)
+    int lba_offset = 0; // 현재 PBA 블록에서 어디까지 썼는지 기록
+    u32 new_pba;
+    int ret;
+
+    mutex_lock(&persist_mtx);
+    // 첫 번째 블록만 블록 사용 여부 검사
+    mutex_lock(&xa_mtx);
+    ret = DRV_get_pba(lba_ptr, &new_pba);
+    mutex_unlock(&xa_mtx);
+
+    if (ret == -ENOSPC) {
+        mutex_unlock(&persist_mtx);
+        return ret;
     }
 
     // request 내 모든 bio_vec 세그먼트 순회
     rq_for_each_segment(bvec, rq, iter) {
-        int bv_len = bvec.bv_len; // bvec가 얼마나 남았는지 기록
+        int bv_len_left = bvec.bv_len; // bvec가 얼마나 남았는지 기록
         int bv_offset = 0; // bvec 내 어디까지 썼는지 기록
 
         // 공간 및 주소 할당
         void *kaddr = bvec_kmap_local(&bvec);
 
-        char *pos = DRV_data + (new_pba * DRV_BLK_SIZE) + lba_offset;
+        // bio vec를 다 읽을 때까지 반복
+        while (bv_len_left > 0) {
+            char *pos = DRV_data + (new_pba * DRV_BLK_SIZE) + lba_offset;
+            int data = min(bv_len_left, DRV_BLK_SIZE - lba_offset);
 
-        if (bv_len < DRV_BLK_SIZE - lba_offset) {
-            // bvec에서 읽어와서 pba 공간에 bvec.len만큼 추가
-            memcpy(pos, kaddr+bv_offset, bv_len);
-            lba_offset += bv_len; // 쓴 위치 기록
-        } else {
-            while (bv_len >= DRV_BLK_SIZE - lba_offset) {
-                // 만약 xa_store 시 값이 있다면 기존 값 반환
-                int cpy_len = DRV_BLK_SIZE - lba_offset;
-                
-                // 메모리 쓰기
-                memcpy(pos, kaddr+bv_offset, cpy_len);
-                bv_len -= cpy_len;
-                bv_offset+= cpy_len;
-                lba_offset += cpy_len;
+            // 메모리 쓰기
+            memcpy(pos, kaddr+bv_offset, data);
+            bv_len_left -= data;
+            bv_offset+= data;
+            lba_offset += data;
+            rq_byte_left -= data;
 
-                // 읽는 동안 L2P 매핑이 변화하면 안 됨
-                mutex_lock(&xa_mtx);
-                old_pba_entry = xa_store(&xa, lba_ptr, xa_mk_value(new_pba), GFP_ATOMIC); // append index to xarray
-                mutex_unlock(&xa_mtx);
+            // PBA 공간에 더 쓸 수 있다면 다음 bio_vec으로 이동
+            if (lba_offset < DRV_BLK_SIZE) break;
 
-                if (old_pba_entry != NULL) { // overwrite인 경우
-                    int old_pba = xa_to_value(old_pba_entry);
-                    
+            void *old_pba_entry;
+            mutex_lock(&xa_mtx);
+            old_pba_entry = xa_store(&xa, lba_ptr, xa_mk_value(new_pba), GFP_ATOMIC); // append index to xarray
+            mutex_unlock(&xa_mtx);
+
+            if (old_pba_entry != NULL) { // overwrite된 블록이라면
+                int old_pba = xa_to_value(old_pba_entry);
+
+                if (old_pba != new_pba) { // 이미 업데이트되어 있지 않으면 (가득 차서 미리 free list로 넣은 게 아니라면)
                     struct free_list *new_node;
                     new_node = kmalloc(sizeof(*new_node), GFP_KERNEL);
                     if (!new_node) {
@@ -650,37 +647,24 @@ int DRV_write(struct request *rq) {
                     list_add(&new_node->node, &free_list_head); // stale node 추가
                     mutex_unlock(&flist_mtx);
                 }
-
-                lba_ptr++;
-                lba_offset = 0;
-
-                // 만약 bvec의 내용을 전부 읽었다면
-                if(bv_len == 0) break;
-                
-                mutex_lock(&write_mtx);
-                // pbr 포인터 업데이트
-                if (pba_ptr < DRV_TOTALBLK) {
-                    new_pba = pba_ptr++;
-                    mutex_unlock(&write_mtx);
-                } else {
-                    int ret = pop_free_list(&new_pba);
-                    mutex_unlock(&write_mtx);
-                    if (ret) {
-                        kunmap_local(kaddr);
-                        mutex_unlock(&persist_mtx);
-                        return ret;
-                    }
-                }
-                pos = DRV_data + (new_pba * DRV_BLK_SIZE);
             }
+            
+            lba_ptr++;
+            lba_offset = 0;
 
-            // 만약 더 쓸 데이터가 남았다면
-            if (bv_len > 0) {
-                memcpy(pos, kaddr + bv_offset, bv_len);
-                lba_offset += bv_len;
+            if (rq_byte_left == 0) break; // 처리가 끝났다면 나가기
+
+            // PBA 업데이트
+            mutex_lock(&xa_mtx);
+            ret = DRV_get_pba(lba_ptr, &new_pba);
+            mutex_unlock(&xa_mtx);
+
+            if (ret == -ENOSPC) {
+                kunmap_local(kaddr);
+                mutex_unlock(&persist_mtx);
+                return ret;
             }
         }
-
         kunmap_local(kaddr);
     }
     mutex_unlock(&persist_mtx);
@@ -706,6 +690,33 @@ int pop_free_list(u32 *pba) {
     
     kfree(node);
 
+    return 0;
+}
+
+int DRV_get_pba(u32 lba, u32 *new_pba)
+{
+    int ret;
+    void *entry;
+    
+    // 만약 아직 pba 공간이 남아있다면
+    mutex_lock(&write_mtx);
+    if (pba_ptr < DRV_TOTALBLK) {
+        *new_pba = pba_ptr++;
+         mutex_unlock(&write_mtx);
+         return 0;
+    }
+    mutex_unlock(&write_mtx);
+
+    // 만약 pba 공간을 사용했다면 free list에서 pop하기
+    ret = pop_free_list(new_pba);
+
+    // free list 공간이 가득 찼다면
+    if (ret == -ENOSPC) {
+        // 이미 쓸 공간이 없다면 기존에 사용하던 공간을 free list에 등록한 후 append 필요
+        entry = xa_load(&xa, lba);
+        if (!entry) return -ENOSPC;
+        *new_pba = xa_to_value(entry);
+    }
     return 0;
 }
 
