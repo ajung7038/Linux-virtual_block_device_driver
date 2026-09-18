@@ -92,7 +92,6 @@ int pop_free_list(u32 *pba);
 static const struct blk_mq_ops bdops =
 {
     .queue_rq = DRV_request, // 실제 I/O 연산 처리
-    // .timeout = DRV_timeout // 타임아웃 처리
 };
 
 static const struct block_device_operations fops = {
@@ -117,6 +116,7 @@ int DRV_init_module(void)
     tag_set.ops = &bdops;
     tag_set.nr_hw_queues = 1; // 하드웨어 큐 개수
     tag_set.queue_depth = 128; // 최대 동시 요청 수
+    tag_set.flags = BLK_MQ_F_BLOCKING; // 블로킹 가능한 큐임을 명시
     
     if (blk_mq_alloc_tag_set(&tag_set))
     {
@@ -421,7 +421,9 @@ int DRV_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cmd, unsigned
 
 int DRV_get_count_display(unsigned long arg)
 {
+    mutex_lock(&xa_mtx);
     int count = DRV_count_xa();
+    mutex_unlock(&xa_mtx);
 
     printk(KERN_INFO "[GET_COUNT] count=%d pba_ptr=%d\n",count, pba_ptr);
 
@@ -448,18 +450,18 @@ int DRV_display_index(unsigned long arg)
     int count = 0;
     struct display_info *display_info;
 
+    mutex_lock(&xa_mtx);
     // find xarray size
     xa_for_each(&xa, i, entry) count++;
-
-    printk(KERN_INFO
-       "[DISPLAY_INDEX] count=%d pba_ptr=%d\n",
-       count, pba_ptr);
 
     unsigned long size = sizeof(*display_info) + count * sizeof(struct display_entry);
     display_info = kvmalloc(size, GFP_KERNEL);
 
     // kmalloc 실패 시
-    if (!display_info) return -ENOMEM;
+    if (!display_info) {
+        mutex_unlock(&xa_mtx);
+        return -ENOMEM;
+    }
 
     int idx = 0;
     xa_for_each(&xa, i, entry) {
@@ -469,9 +471,10 @@ int DRV_display_index(unsigned long arg)
     }
 
     display_info->count = count;
+    mutex_unlock(&xa_mtx);
 
     if (copy_to_user((void __user *)arg, display_info, size)) {
-        kfree(display_info);
+        kvfree(display_info);
         return -EFAULT;
     }
 
@@ -484,7 +487,6 @@ int DRV_read(struct request *rq)
     struct bio_vec bvec; // 물리 메모리 주소의 연속된 범위를 표현하는 구조체
     struct req_iterator iter;
     u32 lba_ptr = blk_rq_pos(rq); // 현재 섹터 위치 얻어오기
-    int lba_left_len =  blk_rq_bytes(rq); // request 전체에서 읽어야 할 남은 바이트 기록
     int lba_offset = 0; // LBA 블록 내 어디까지 읽었는지 기록 (0 ~ 512B 사이의 값)
     
     mutex_lock(&xa_mtx);
@@ -493,89 +495,32 @@ int DRV_read(struct request *rq)
     rq_for_each_segment(bvec, rq, iter) {
         int bv_left_len = bvec.bv_len; // bvec가 얼마나 남았는지 기록
         int bv_offset = 0; // bvec 내 어디까지 썼는지 기록
+        void *kaddr = bvec_kmap_local(&bvec); // 공간 및 주소 할당
 
-        void *entry = xa_load(&xa, lba_ptr);
+        while (bv_left_len > 0) {
+            int data = min(bv_left_len, DRV_BLK_SIZE - lba_offset);
 
-        // 읽기에 실패한 경우
-        if (!entry) {
-            mutex_unlock(&xa_mtx);
-            return 0;
-        }
+            void *entry = xa_load(&xa, lba_ptr);
 
-        // 공간 및 주소 할당
-        void *kaddr = bvec_kmap_local(&bvec);
-
-        // 현재 위치 계산
-        u32 read_pba = xa_to_value(entry);
-        char *pos = DRV_data + (read_pba * DRV_BLK_SIZE) + lba_offset;
-
-        // LBA 데이터를 읽어서 bvec에 추가
-        // 블록 값이 넘어가면 pba 값도 다시 계산 필요
-        if (lba_left_len > DRV_BLK_SIZE - lba_offset) {
-
-            if (bvec.bv_len < DRV_BLK_SIZE - lba_offset) {
-                memcpy(kaddr+bv_offset, pos, bvec.bv_len);
-                lba_left_len -= bvec.bv_len;
-                bv_offset += bvec.bv_len;
-                lba_offset += bvec.bv_len;
+            // 읽을 데이터가 없는 경우 0 반환
+            if (!entry) {
+                memset(kaddr + bv_offset, 0, data);
             } else {
-                while (bv_left_len >= DRV_BLK_SIZE - lba_offset) {
-                    int cpy_len = DRV_BLK_SIZE - lba_offset;
-                    memcpy(kaddr+bv_offset, pos, cpy_len);
-
-                    bv_offset += cpy_len;
-                    bv_left_len -= cpy_len;
-                    lba_left_len -= cpy_len;
-
-                    lba_ptr++;
-                    lba_offset = 0;
-
-                    if (bv_left_len == 0) break; // 만약 bvec를 다 사용했다면 break
-
-                    
-                    entry = xa_load(&xa, lba_ptr);
-                    // 읽기에 실패한 경우
-                    if (!entry) {
-                        printk("Error read pba data");
-                        mutex_unlock(&xa_mtx);
-                        kunmap_local(kaddr);
-                        return -EFAULT;
-                    }
-                    read_pba = xa_to_value(entry);
-                    pos = DRV_data + (read_pba * DRV_BLK_SIZE);
-                }
-                if (bv_left_len > 0) {
-                    memcpy(kaddr+bv_offset, pos, bv_left_len);
-
-                    bv_offset += bv_left_len;
-                    lba_offset += bv_left_len;
-                    lba_left_len -= bv_left_len;
-
-                    bv_left_len = 0;
-                }
+                // 현재 위치 계산
+                u32 read_pba = xa_to_value(entry);
+                char *pos = DRV_data + (read_pba * DRV_BLK_SIZE) + lba_offset;
+                memcpy(kaddr+bv_offset, pos, data);
             }
-        } else {
-            if (bvec.bv_len < lba_left_len) {
-                memcpy(kaddr+bv_offset, pos, bvec.bv_len);
 
-                lba_offset += bvec.bv_len;
-                lba_left_len -= bvec.bv_len;
-                bv_offset += bv_left_len;
-            } else { // LBA 내용 전부를 읽을 수 있음
-                memcpy(kaddr+bv_offset, pos, lba_left_len);
+            bv_left_len -= data;
+            bv_offset += data;
+            lba_offset += data;
 
-                bv_offset += lba_left_len;
-                lba_offset += lba_left_len;
-                lba_left_len = 0;
-
-                if (lba_offset == DRV_BLK_SIZE) {
-                    lba_offset = 0;
-                    lba_ptr++;
-                }
+            if (lba_offset == DRV_BLK_SIZE) {
+                lba_ptr++;
+                lba_offset = 0;
             }
-            
         }
-
         kunmap_local(kaddr);
     }
     mutex_unlock(&xa_mtx);
@@ -593,12 +538,13 @@ int DRV_write(struct request *rq) {
     int ret;
 
     mutex_lock(&persist_mtx);
-    // 첫 번째 블록만 블록 사용 여부 검사
     mutex_lock(&xa_mtx);
+    // 첫 번째 블록만 블록 사용 여부 검사
     ret = DRV_get_pba(lba_ptr, &new_pba);
-    mutex_unlock(&xa_mtx);
+
 
     if (ret == -ENOSPC) {
+        mutex_unlock(&xa_mtx);
         mutex_unlock(&persist_mtx);
         return ret;
     }
@@ -627,9 +573,7 @@ int DRV_write(struct request *rq) {
             if (lba_offset < DRV_BLK_SIZE) break;
 
             void *old_pba_entry;
-            mutex_lock(&xa_mtx);
             old_pba_entry = xa_store(&xa, lba_ptr, xa_mk_value(new_pba), GFP_ATOMIC); // append index to xarray
-            mutex_unlock(&xa_mtx);
 
             if (old_pba_entry != NULL) { // overwrite된 블록이라면
                 int old_pba = xa_to_value(old_pba_entry);
@@ -638,6 +582,7 @@ int DRV_write(struct request *rq) {
                     struct free_list *new_node;
                     new_node = kmalloc(sizeof(*new_node), GFP_KERNEL);
                     if (!new_node) {
+                        mutex_unlock(&xa_mtx);
                         mutex_unlock(&persist_mtx);
                         kunmap_local(kaddr);
                         return -ENOMEM;
@@ -655,18 +600,18 @@ int DRV_write(struct request *rq) {
             if (rq_byte_left == 0) break; // 처리가 끝났다면 나가기
 
             // PBA 업데이트
-            mutex_lock(&xa_mtx);
             ret = DRV_get_pba(lba_ptr, &new_pba);
-            mutex_unlock(&xa_mtx);
 
             if (ret == -ENOSPC) {
                 kunmap_local(kaddr);
+                mutex_unlock(&xa_mtx);
                 mutex_unlock(&persist_mtx);
                 return ret;
             }
         }
         kunmap_local(kaddr);
     }
+    mutex_unlock(&xa_mtx);
     mutex_unlock(&persist_mtx);
     return 0;
 }
