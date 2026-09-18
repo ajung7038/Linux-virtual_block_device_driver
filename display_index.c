@@ -5,8 +5,8 @@
 #include <unistd.h>
 
 #define             IOCTL_MAGIC         'G'
-#define             DISPLAY_INDEX       _IOR(IOCTL_MAGIC, 2 ,struct display_info)
-#define             GET_COUNT           _IOR(IOCTL_MAGIC, 3 ,struct display_info)
+#define             DISPLAY_INDEX       _IOR(IOCTL_MAGIC, 2, struct display_info)
+#define             GET_COUNT           _IOR(IOCTL_MAGIC, 3, int)
 
 int main(void) {
     struct display_entry {
@@ -34,7 +34,7 @@ int main(void) {
         return 1;
     }
 
-    int size = sizeof(struct display_info) + count * sizeof(struct display_entry);
+    int size = sizeof(struct display_info) + 32768 * sizeof(struct display_entry);
 
     // 공간 할당
     struct display_info *info_data = malloc(size);
